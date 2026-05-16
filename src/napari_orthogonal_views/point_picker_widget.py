@@ -1,14 +1,16 @@
 import itertools
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import affiners
 import numpy as np
 from napari.utils.notifications import show_warning
 from napari.viewer import Viewer
-from scipy.ndimage import affine_transform as scipy_affine_transform
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
     QDoubleSpinBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -61,7 +63,9 @@ def _validate_point_arrays(
     if source_points.ndim != 2 or target_points.ndim != 2:
         raise ValueError("Point arrays must be 2-dimensional (N, ndim).")
     if source_points.shape != target_points.shape:
-        raise ValueError("Source and target point arrays must have the same shape.")
+        raise ValueError(
+            "Source and target point arrays must have the same shape."
+        )
 
     n, ndim = source_points.shape
     if n < ndim + 1:
@@ -94,7 +98,9 @@ def estimate_affine_from_points(
     ValueError
         If fewer than ndim+1 point pairs are provided.
     """
-    source_points, target_points = _validate_point_arrays(source_points, target_points)
+    source_points, target_points = _validate_point_arrays(
+        source_points, target_points
+    )
     n, ndim = source_points.shape
 
     # Add homogeneous coordinate
@@ -136,7 +142,9 @@ def estimate_affine_from_points_no_scale(
     ValueError
         If fewer than ndim+1 point pairs are provided.
     """
-    source_points, target_points = _validate_point_arrays(source_points, target_points)
+    source_points, target_points = _validate_point_arrays(
+        source_points, target_points
+    )
     n, ndim = source_points.shape
 
     src_homo = np.hstack([source_points, np.ones((n, 1))])
@@ -162,6 +170,275 @@ def estimate_affine_from_points_no_scale(
     return affine_matrix
 
 
+def estimate_affine_from_points_masked(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    mask: np.ndarray,
+    fixed_values: np.ndarray | None = None,
+) -> np.ndarray:
+    """Estimate an affine with a user-specified subset of parameters free.
+
+    Generalizes :func:`estimate_affine_from_points_no_scale`: instead of
+    hard-coding which entries of the linear+translation block are fixed,
+    the caller passes a boolean mask the same shape as that block.
+
+    For each target dimension ``j``, the entries of row ``j`` of the affine
+    flagged as free in ``mask`` are optimized via least squares; the rest
+    are held to ``fixed_values[j]`` (default: identity — ones on the
+    diagonal, zeros elsewhere).
+
+    Parameters
+    ----------
+    source_points : np.ndarray
+        (N, ndim) array of source coordinates.
+    target_points : np.ndarray
+        (N, ndim) array of target coordinates.
+    mask : array_like of bool
+        (ndim, ndim+1) mask. ``True`` (or any truthy value) marks an entry
+        as free to optimize; ``False`` holds it at ``fixed_values``.
+    fixed_values : np.ndarray, optional
+        (ndim, ndim+1) values used for entries where ``mask`` is False.
+        Defaults to ``np.eye(ndim, ndim+1)`` so non-optimized entries take
+        identity values.
+
+    Returns
+    -------
+    np.ndarray
+        (ndim+1, ndim+1) homogeneous affine matrix.
+
+    Raises
+    ------
+    ValueError
+        If point arrays are inconsistent, ``mask``/``fixed_values`` shapes
+        don't match ``(ndim, ndim+1)``, or any row of ``mask`` has more
+        free parameters than data points.
+    """
+    source_points, target_points = _validate_point_arrays(
+        source_points, target_points
+    )
+    n, ndim = source_points.shape
+
+    mask = np.asarray(mask).astype(bool)
+    expected_shape = (ndim, ndim + 1)
+    if mask.shape != expected_shape:
+        raise ValueError(
+            f"mask must have shape {expected_shape}, got {mask.shape}."
+        )
+
+    if fixed_values is None:
+        fixed_values = np.eye(ndim, ndim + 1)
+    else:
+        fixed_values = np.asarray(fixed_values, dtype=float)
+        if fixed_values.shape != expected_shape:
+            raise ValueError(
+                f"fixed_values must have shape {expected_shape}, "
+                f"got {fixed_values.shape}."
+            )
+
+    src_homo = np.hstack([source_points, np.ones((n, 1))])
+    affine_matrix = np.eye(ndim + 1)
+    affine_matrix[:ndim, :] = fixed_values
+
+    for j in range(ndim):
+        free_idx = np.flatnonzero(mask[j])
+        fixed_idx = np.flatnonzero(~mask[j])
+
+        if free_idx.size == 0:
+            continue
+        if free_idx.size > n:
+            raise ValueError(
+                f"Row {j} has {free_idx.size} free parameters but only {n} "
+                "point pairs are available."
+            )
+
+        # Subtract the contribution of the held-fixed entries from the RHS,
+        # then solve least squares for the free ones.
+        rhs = (
+            target_points[:, j]
+            - src_homo[:, fixed_idx] @ fixed_values[j, fixed_idx]
+        )
+        lhs = src_homo[:, free_idx]
+        coeffs, _, _, _ = np.linalg.lstsq(lhs, rhs, rcond=None)
+        affine_matrix[j, free_idx] = coeffs
+
+    return affine_matrix
+
+
+def _decompose_linear_3d(
+    L: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Factor a 3x3 linear map L as ``R · diag(s) · H``.
+
+    R is a rotation (so(3), returned as an axis-angle 3-vector), ``s`` are
+    the three scales (positive when ``det(L) > 0``), and H is unit
+    upper-triangular shear, returned as ``(h01, h02, h12)``.
+
+    Used to seed :func:`estimate_affine_from_points_components` from the
+    unconstrained least-squares estimate.
+    """
+    from scipy.spatial.transform import Rotation
+
+    Q, K = np.linalg.qr(L)
+    # Force positive diagonals on K by absorbing signs into Q
+    signs = np.sign(np.diag(K))
+    signs[signs == 0] = 1
+    K = signs[:, None] * K
+    Q = Q * signs[None, :]
+    # Resolve reflections so Q is a proper rotation (det = +1)
+    if np.linalg.det(Q) < 0:
+        Q[:, -1] *= -1
+        K[-1, :] *= -1
+
+    scale = np.diag(K).copy()
+    H = K / scale[:, None]
+    shear = np.array([H[0, 1], H[0, 2], H[1, 2]])
+    rotvec = Rotation.from_matrix(Q).as_rotvec()
+    return rotvec, scale, shear
+
+
+def _compose_affine_3d(
+    rotvec: np.ndarray,
+    scale: np.ndarray,
+    shear: np.ndarray,
+    translation: np.ndarray,
+) -> np.ndarray:
+    """Inverse of :func:`_decompose_linear_3d`; builds the 4x4 affine."""
+    from scipy.spatial.transform import Rotation
+
+    R = Rotation.from_rotvec(rotvec).as_matrix()
+    S = np.diag(scale)
+    H = np.array(
+        [
+            [1.0, shear[0], shear[1]],
+            [0.0, 1.0, shear[2]],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    A = np.eye(4)
+    A[:3, :3] = R @ S @ H
+    A[:3, 3] = translation
+    return A
+
+
+def _normalize_component_mask(mask, name: str) -> np.ndarray:
+    """Coerce a ``fix_*`` argument to a length-3 boolean array.
+
+    A scalar bool broadcasts across all three axes; a length-3 sequence is
+    converted as-is.
+    """
+    if isinstance(mask, (bool, np.bool_)):
+        return np.array([bool(mask)] * 3, dtype=bool)
+    arr = np.asarray(mask)
+    if arr.shape != (3,):
+        raise ValueError(
+            f"{name} must be a bool or a length-3 sequence of bools, "
+            f"got shape {arr.shape}."
+        )
+    return arr.astype(bool)
+
+
+def estimate_affine_from_points_components(
+    source_points: np.ndarray,
+    target_points: np.ndarray,
+    fix_scale=False,
+    fix_shear=False,
+    fix_rotation=False,
+    fix_translation=False,
+) -> np.ndarray:
+    """Estimate a 3D affine with selected per-axis components held fixed.
+
+    The affine is parameterized as
+
+        A = T · R · S · H
+
+    with 12 free parameters total:
+
+    - rotation: so(3) axis-angle ``(rx, ry, rz)``
+    - scale:    diagonal ``(sx, sy, sz)``
+    - shear:    unit-upper-triangular ``(h01, h02, h12)``
+    - translation: ``(tx, ty, tz)``
+
+    Each ``fix_<component>`` argument controls which entries of that
+    component are held at the identity value during optimization. It can be:
+
+    - a single bool — broadcast across all three axes;
+    - a length-3 sequence of bools — per-axis (``True`` = fixed).
+
+    Example: ``fix_rotation=(False, True, True)`` keeps ``rx`` free and
+    pins ``ry``/``rz`` to 0.
+
+    Identity values used for held entries are: scale=1, shear=0,
+    rotation=0 (axis-angle), translation=0. Free entries are initialized
+    from the QR decomposition of the unconstrained linear LS estimate,
+    then refined via :func:`scipy.optimize.least_squares` (LM).
+
+    Only 3D point sets are supported.
+
+    Returns
+    -------
+    np.ndarray
+        4x4 homogeneous affine matrix.
+    """
+    from scipy.optimize import least_squares
+
+    source_points, target_points = _validate_point_arrays(
+        source_points, target_points
+    )
+    _, ndim = source_points.shape
+    if ndim != 3:
+        raise ValueError(
+            "estimate_affine_from_points_components supports only 3D points; "
+            f"got ndim={ndim}."
+        )
+
+    fix_rot = _normalize_component_mask(fix_rotation, "fix_rotation")
+    fix_sca = _normalize_component_mask(fix_scale, "fix_scale")
+    fix_she = _normalize_component_mask(fix_shear, "fix_shear")
+    fix_tra = _normalize_component_mask(fix_translation, "fix_translation")
+    free_mask = np.concatenate([~fix_rot, ~fix_sca, ~fix_she, ~fix_tra])
+
+    id_full = np.concatenate(
+        [np.zeros(3), np.ones(3), np.zeros(3), np.zeros(3)]
+    )
+
+    # Seed free entries from an unconstrained LS fit. If everything is
+    # fixed there's nothing to optimize — return identity directly.
+    if not free_mask.any():
+        return np.eye(4)
+
+    A_init = estimate_affine_from_points(source_points, target_points)
+    try:
+        init_rotvec, init_scale, init_shear = _decompose_linear_3d(
+            A_init[:3, :3]
+        )
+        init_trans = A_init[:3, 3]
+    except np.linalg.LinAlgError:
+        init_rotvec = np.zeros(3)
+        init_scale = np.ones(3)
+        init_shear = np.zeros(3)
+        init_trans = np.zeros(3)
+
+    init_full = np.concatenate(
+        [init_rotvec, init_scale, init_shear, init_trans]
+    )
+    x0 = init_full[free_mask]
+
+    def unpack(x: np.ndarray) -> tuple:
+        full = id_full.copy()
+        full[free_mask] = x
+        return full[0:3], full[3:6], full[6:9], full[9:12]
+
+    def residuals(x: np.ndarray) -> np.ndarray:
+        rotvec, scale, shear, trans = unpack(x)
+        A = _compose_affine_3d(rotvec, scale, shear, trans)
+        pred = (A[:3, :3] @ source_points.T).T + A[:3, 3]
+        return (pred - target_points).ravel()
+
+    result = least_squares(residuals, x0, method="lm")
+    rotvec, scale, shear, trans = unpack(result.x)
+    return _compose_affine_3d(rotvec, scale, shear, trans)
+
+
 class PointPickerWidget(QWidget):
     """Widget for picking matched point pairs across two image layers."""
 
@@ -172,7 +449,9 @@ class PointPickerWidget(QWidget):
         viewer: Viewer,
         layer1_name: str = "Image 1",
         layer2_name: str = "Image 2",
-        affine_estimator: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
+        affine_estimator: (
+            Callable[[np.ndarray, np.ndarray], np.ndarray] | None
+        ) = None,
     ):
         super().__init__()
 
@@ -180,7 +459,9 @@ class PointPickerWidget(QWidget):
         self.layer1_name = layer1_name
         self.layer2_name = layer2_name
         self.affine_estimator = affine_estimator or estimate_affine_from_points
-        self.point_pairs: dict[int, PointPair] = {}  # Use dict for stable pair_id lookup
+        self.point_pairs: dict[int, PointPair] = (
+            {}
+        )  # Use dict for stable pair_id lookup
         self._next_pair_id = 0
         self.transform_snapshot: dict | None = None
         self._applied_affine: np.ndarray | None = None
@@ -192,7 +473,9 @@ class PointPickerWidget(QWidget):
         # Create table
         self.table = QTableWidget()
         self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Pair", layer1_name, layer2_name, ""])
+        self.table.setHorizontalHeaderLabels(
+            ["Pair", layer1_name, layer2_name, ""]
+        )
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setColumnWidth(0, 80)
         self.table.setColumnWidth(1, 150)
@@ -202,6 +485,15 @@ class PointPickerWidget(QWidget):
         # Add new pair button
         self.add_button = QPushButton("Add new pair")
         self.add_button.clicked.connect(self.add_pair)
+
+        # Save / Load buttons for point pairs
+        self.save_points_button = QPushButton("Save Points")
+        self.save_points_button.clicked.connect(self._save_points_dialog)
+        self.load_points_button = QPushButton("Load Points")
+        self.load_points_button.clicked.connect(self._load_points_dialog)
+        save_load_layout = QHBoxLayout()
+        save_load_layout.addWidget(self.save_points_button)
+        save_load_layout.addWidget(self.load_points_button)
 
         # Transform buttons
         self.apply_button = QPushButton("Apply Estimated Affine")
@@ -243,6 +535,7 @@ class PointPickerWidget(QWidget):
         layout = QVBoxLayout()
         layout.addWidget(self.table)
         layout.addWidget(self.add_button)
+        layout.addLayout(save_load_layout)
         layout.addWidget(nudge_group)
         layout.addLayout(button_layout)
         self.setLayout(layout)
@@ -278,7 +571,9 @@ class PointPickerWidget(QWidget):
         if self._affine_base_translate is not None:
             return self._affine_base_translate.copy()
         self._capture_translates()
-        return self._original_translates.get(self.layer2_name, np.zeros(3)).copy()
+        return self._original_translates.get(
+            self.layer2_name, np.zeros(3)
+        ).copy()
 
     def _update_layer2_translate(self) -> None:
         """Set layer2.translate to base + nudge_offset."""
@@ -352,7 +647,9 @@ class PointPickerWidget(QWidget):
         # Column 3: Delete button
         delete_button = QPushButton("×")
         delete_button.setMaximumWidth(30)
-        delete_button.clicked.connect(lambda checked, pid=pair_id: self._delete_pair(pid))
+        delete_button.clicked.connect(
+            lambda checked, pid=pair_id: self._delete_pair(pid)
+        )
         self.table.setCellWidget(row, 3, delete_button)
 
         # Update button states
@@ -375,7 +672,9 @@ class PointPickerWidget(QWidget):
 
         if coords is None:
             # No coordinate saved yet, default to layer's origin in world space
-            layer_name = self.layer1_name if layer == "layer1" else self.layer2_name
+            layer_name = (
+                self.layer1_name if layer == "layer1" else self.layer2_name
+            )
             translate = self._original_translates.get(layer_name, np.zeros(3))
             coords = tuple(translate.tolist())
 
@@ -383,7 +682,9 @@ class PointPickerWidget(QWidget):
             if self._applied_affine is not None:
                 coords = self._transform_coords(coords, self._applied_affine)
             if not np.allclose(self._nudge_offset, 0):
-                coords = tuple((np.array(coords) + self._nudge_offset).tolist())
+                coords = tuple(
+                    (np.array(coords) + self._nudge_offset).tolist()
+                )
 
         self.viewer.dims.point = coords
 
@@ -435,7 +736,9 @@ class PointPickerWidget(QWidget):
         # Update button states
         self._update_button_states()
 
-    def _world_to_original_data(self, coords: tuple | None, layer_name: str) -> tuple | None:
+    def _world_to_original_data(
+        self, coords: tuple | None, layer_name: str
+    ) -> tuple | None:
         """Convert world coordinates to the layer's original data coordinates.
 
         Subtracts the layer's original translate (captured before any padding
@@ -472,9 +775,20 @@ class PointPickerWidget(QWidget):
         layer1 = []
         layer2 = []
         for pair in self.point_pairs.values():
-            if pair.layer1_coords is not None and pair.layer2_coords is not None:
-                layer1.append(self._world_to_original_data(pair.layer1_coords, self.layer1_name))
-                layer2.append(self._world_to_original_data(pair.layer2_coords, self.layer2_name))
+            if (
+                pair.layer1_coords is not None
+                and pair.layer2_coords is not None
+            ):
+                layer1.append(
+                    self._world_to_original_data(
+                        pair.layer1_coords, self.layer1_name
+                    )
+                )
+                layer2.append(
+                    self._world_to_original_data(
+                        pair.layer2_coords, self.layer2_name
+                    )
+                )
         return {self.layer1_name: layer1, self.layer2_name: layer2}
 
     def clear_pairs(self) -> None:
@@ -500,9 +814,72 @@ class PointPickerWidget(QWidget):
             self.add_pair()
             pair_id = self._next_pair_id - 1
             point_pair = self.point_pairs[pair_id]
-            point_pair.layer1_coords = self._original_data_to_world(tuple(l1), self.layer1_name)
-            point_pair.layer2_coords = self._original_data_to_world(tuple(l2), self.layer2_name)
+            point_pair.layer1_coords = self._original_data_to_world(
+                tuple(l1), self.layer1_name
+            )
+            point_pair.layer2_coords = self._original_data_to_world(
+                tuple(l2), self.layer2_name
+            )
         self._update_button_states()
+
+    def _save_points_dialog(self) -> None:
+        """Prompt for a path and write current point pairs as JSON."""
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save point pairs",
+            "point_pairs.json",
+            "JSON (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        pairs = self.get_point_pairs()
+        payload = {
+            "layer1_name": self.layer1_name,
+            "layer2_name": self.layer2_name,
+            "pairs": {
+                self.layer1_name: [list(c) for c in pairs[self.layer1_name]],
+                self.layer2_name: [list(c) for c in pairs[self.layer2_name]],
+            },
+        }
+        with open(path, "w") as fh:
+            json.dump(payload, fh, indent=2)
+        print(f"[PointPicker] Saved {len(pairs[self.layer1_name])} pairs to {path}")
+
+    def _load_points_dialog(self) -> None:
+        """Prompt for a JSON file and load point pairs from it."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load point pairs",
+            "",
+            "JSON (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        with open(path) as fh:
+            payload = json.load(fh)
+        # Accept both the wrapped format written by _save_points_dialog and
+        # a bare dict matching the load_point_pairs() signature.
+        if "pairs" in payload and isinstance(payload["pairs"], dict):
+            pairs_raw = payload["pairs"]
+            src_l1 = payload.get("layer1_name")
+            src_l2 = payload.get("layer2_name")
+        else:
+            pairs_raw = payload
+            src_l1 = src_l2 = None
+
+        # Remap layer-name keys to the current widget's layer names if needed.
+        if src_l1 and src_l2 and (
+            src_l1 != self.layer1_name or src_l2 != self.layer2_name
+        ):
+            pairs = {
+                self.layer1_name: pairs_raw[src_l1],
+                self.layer2_name: pairs_raw[src_l2],
+            }
+        else:
+            pairs = pairs_raw
+
+        self.load_point_pairs(pairs)
+        print(f"[PointPicker] Loaded {len(pairs[self.layer1_name])} pairs from {path}")
 
     def _update_button_states(self) -> None:
         """Update the enabled state of the Apply and Reset buttons."""
@@ -575,12 +952,26 @@ class PointPickerWidget(QWidget):
             self.transform_snapshot = {
                 "affine": layer.affine.affine_matrix.copy(),
                 "data": layer.data,
-                "translate": np.array(layer.translate, dtype=float) - self._nudge_offset,
+                "translate": np.array(layer.translate, dtype=float)
+                - self._nudge_offset,
             }
 
         # Compute affine (world-space: layer2-world → layer1-world)
         affine = self._estimate_affine_transform()
         if affine is not None:
+            pairs = self.get_point_pairs()
+            np.set_printoptions(suppress=True, precision=10, linewidth=200)
+            print("[PointPicker] Selected point pairs (original data space):")
+            for l1_pt, l2_pt in zip(
+                pairs[self.layer1_name], pairs[self.layer2_name]
+            ):
+                print(f"  {self.layer1_name}: {l1_pt}   {self.layer2_name}: {l2_pt}")
+            print("[PointPicker] World-space affine (layer2 → layer1):")
+            print(affine)
+            data_affine = self.get_estimated_affine()
+            print("[PointPicker] Data-space affine (layer2 → layer1):")
+            print(data_affine)
+
             ndim = affine.shape[0] - 1
             A_lin = affine[:ndim, :ndim]
             A_trans = affine[:ndim, ndim]
@@ -589,10 +980,14 @@ class PointPickerWidget(QWidget):
             # Layer2's original translate (not current — current may be bbox_min
             # from a previous application)
             T2 = self.transform_snapshot["translate"][:ndim]
-            data_shape = np.array(self.transform_snapshot["data"].shape[:ndim], dtype=float)
+            data_shape = np.array(
+                self.transform_snapshot["data"].shape[:ndim], dtype=float
+            )
 
             # Build the 2^ndim corners of layer2 in world space
-            corners_data = np.array(list(itertools.product(*[(0, s) for s in data_shape])))
+            corners_data = np.array(
+                list(itertools.product(*[(0, s) for s in data_shape]))
+            )
             corners_world = corners_data + T2
 
             # Transform corners through the affine (layer2-world → layer1-world)
@@ -603,22 +998,29 @@ class PointPickerWidget(QWidget):
             bbox_max = np.ceil(corners_transformed.max(axis=0)).astype(int)
             output_shape = tuple((bbox_max - bbox_min).tolist())
 
-            # scipy inverse mapping: output index o → world w = o + bbox_min
+            # Inverse mapping: output index o → world w = o + bbox_min
             # then world → layer2-data: d2 = A_lin_inv @ (w - A_trans) - T2
-            # combined: d2 = A_lin_inv @ (o + bbox_min - A_trans) - T2
-            #         = A_lin_inv @ o + A_lin_inv @ (bbox_min - A_trans) - T2
-            scipy_matrix = A_lin_inv
-            scipy_offset = A_lin_inv @ (bbox_min.astype(float) - A_trans) - T2
+            # combined: d2 = A_lin_inv @ o + A_lin_inv @ (bbox_min - A_trans) - T2
+            inv_offset = A_lin_inv @ (bbox_min.astype(float) - A_trans) - T2
+
+            affiners_matrix = np.eye(ndim + 1)
+            affiners_matrix[:ndim, :ndim] = A_lin_inv
+            affiners_matrix[:ndim, ndim] = inv_offset
+            import torch
+
+            data = (
+                torch.from_numpy(self.transform_snapshot["data"])
+                .to(torch.float16)
+                .numpy()
+            )
 
             target_dtype = self.transform_snapshot["data"].dtype
-            transformed = scipy_affine_transform(
-                self.transform_snapshot["data"].astype(np.float32),
-                scipy_matrix,
-                offset=scipy_offset,
+            transformed = affiners.affine_transform(
+                data,
+                affiners_matrix,
                 output_shape=output_shape,
-                order=1,
             )
-            layer.data = transformed.astype(target_dtype)
+            layer.data = transformed
 
             # Restore original affine (identity in most cases) so no
             # non-orthogonal slicing occurs.
@@ -655,7 +1057,9 @@ class PointPickerWidget(QWidget):
         layer = self.viewer.layers[self.layer2_name]
         layer.data = self.transform_snapshot["data"]
         layer.affine = self.transform_snapshot["affine"]
-        layer.translate = self.transform_snapshot["translate"] + self._nudge_offset
+        layer.translate = (
+            self.transform_snapshot["translate"] + self._nudge_offset
+        )
         self.transform_snapshot = None
         self._applied_affine = None
         self._affine_base_translate = None
@@ -684,8 +1088,12 @@ class PointPickerWidget(QWidget):
 
         ndim = affine.shape[0] - 1
 
-        t1 = self._original_translates.get(self.layer1_name, np.zeros(ndim))[:ndim]
-        t2 = self._original_translates.get(self.layer2_name, np.zeros(ndim))[:ndim]
+        t1 = self._original_translates.get(self.layer1_name, np.zeros(ndim))[
+            :ndim
+        ]
+        t2 = self._original_translates.get(self.layer2_name, np.zeros(ndim))[
+            :ndim
+        ]
 
         # If both translates are zero (no offset), skip conjugation
         if np.allclose(t1, 0) and np.allclose(t2, 0):

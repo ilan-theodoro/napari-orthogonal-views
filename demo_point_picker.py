@@ -68,6 +68,20 @@ manager = show_point_picker(
     affine_estimator=estimate_affine_from_points_no_scale,
 )
 
+
+def _on_affine_applied(affine):
+    pairs = manager.get_registration_points()
+    np.set_printoptions(suppress=True, precision=10, linewidth=200)
+    print("=== Affine applied ===")
+    print("Selected point pairs (data space):")
+    for l1_pt, l2_pt in zip(pairs["Fixed"], pairs["Moving"]):
+        print(f"  Fixed: {l1_pt}   Moving: {l2_pt}")
+    print("World-space affine (Moving → Fixed):")
+    print(affine)
+
+
+manager.point_picker_widget.affine_applied.connect(_on_affine_applied)
+
 # Pre-populate a few known correspondences so you can test immediately
 n_seed = min(5, N)
 seed_pairs = {
