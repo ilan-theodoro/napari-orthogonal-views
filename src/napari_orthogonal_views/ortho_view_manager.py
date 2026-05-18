@@ -49,19 +49,22 @@ def center_cross_on_mouse(
         )
         return
 
-    step = tuple(
-        np.round(
-            [
-                max(min_, min(p, max_)) / step
-                for p, (min_, max_, step) in zip(
-                    viewer_model.cursor.position,
-                    viewer_model.dims.range,
-                    strict=False,
-                )
-            ]
-        ).astype(int)
+    # Clamp the world-space cursor position into each axis's valid range and
+    # set dims.point directly. dims.point is the world-coordinate twin of
+    # current_step, so napari handles the (world - range.start) / range.step
+    # conversion per axis. Computing current_step here by hand as `p / step`
+    # is only correct when range.start == 0 -- after applying an affine that
+    # gives layer2 a non-zero translate, the bbox of the displayed layers
+    # shifts and that assumption silently breaks.
+    clamped_position = tuple(
+        max(min_, min(p, max_))
+        for p, (min_, max_, _) in zip(
+            viewer_model.cursor.position,
+            viewer_model.dims.range,
+            strict=False,
+        )
     )
-    viewer_model.dims.current_step = step
+    viewer_model.dims.point = clamped_position
 
 
 def init_actions():

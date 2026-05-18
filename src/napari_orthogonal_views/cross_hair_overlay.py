@@ -123,13 +123,12 @@ class VispyCrosshairOverlay(ViewerOverlayMixin, VispySceneOverlay):
     def _move_crosshairs(self) -> None:
         """Move the crosshairs to the current viewer step."""
 
-        step_size = [dim_range.step for dim_range in self.viewer.dims.range]
-        position = [
-            pos * step
-            for pos, step in zip(
-                self.viewer.dims.current_step, step_size, strict=False
-            )
-        ]
+        # Use world coordinates directly (dims.point already encodes
+        # range.start + current_step * range.step). Recomputing as
+        # `current_step * range.step` -- as this used to -- drops the
+        # range.start offset and pulls the crosshair off-mark whenever a
+        # displayed layer has a non-zero translate.
+        position = list(self.viewer.dims.point)
 
         displayed = list(self.viewer.dims.displayed[::-1])
         not_displayed = list(self.viewer.dims.not_displayed[::-1])

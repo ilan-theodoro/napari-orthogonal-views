@@ -30,6 +30,7 @@ from napari_orthogonal_views import (  # noqa: E402
     show_point_picker,
 )
 
+
 def _channel_label(zarr_path: Path, channel: int) -> str:
     attrs_path = zarr_path.parent / ".zattrs"
     if not attrs_path.exists():
@@ -249,11 +250,11 @@ def main() -> None:
     # camera (e.g. different stains on a shared detector). It disallows
     # rotations that depend on Z -- the slices should keep their geometry
     # regardless of their Z position -- and locks the scale to prevent drift.
-    # affine_estimator = partial(
-    #     estimate_affine_from_points_components,
-    #     fix_rotation=(False, True, True),
-    #     fix_scale=True,
-    # )
+    affine_estimator = partial(
+        estimate_affine_from_points_components,
+        fix_rotation=(False, True, True),
+        fix_scale=(True, False, False),
+    )
 
     # NOTE: This estimator restricts the affine to the XY slice plane only:
     # the mask leaves the Z row as identity and zeroes the Z column, so only
@@ -261,12 +262,12 @@ def main() -> None:
     # when aligning two physical cameras from raw (non-processed) views, where
     # the cameras share the Z stage geometry and only the XY relationship
     # needs to be solved.
-    mask = np.zeros((3, 4), dtype=bool)
-    mask[1:3, 1:4] = True
-    affine_estimator = partial(
-        estimate_affine_from_points_masked,
-        mask=mask,
-    )
+    # mask = np.zeros((3, 4), dtype=bool)
+    # mask[1:3, 1:4] = True
+    # affine_estimator = partial(
+    #     estimate_affine_from_points_masked,
+    #     mask=mask,
+    # )
 
     show_point_picker(
         viewer,

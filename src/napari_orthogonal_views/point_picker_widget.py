@@ -504,10 +504,21 @@ class PointPickerWidget(QWidget):
         self.reset_button.clicked.connect(self._reset_transform)
         self.reset_button.setEnabled(False)
 
+        self.restart_button = QPushButton("Reset (keep view)")
+        self.restart_button.setToolTip(
+            "Clear point pairs and transform state but leave the moving "
+            "layer's currently displayed image in place. Use this to pick "
+            "a fresh set of correspondences on top of the partial alignment "
+            "for iterative refinement."
+        )
+        self.restart_button.clicked.connect(self._restart_from_current)
+        self.restart_button.setEnabled(False)
+
         # Button layout
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.apply_button)
         button_layout.addWidget(self.reset_button)
+        button_layout.addWidget(self.restart_button)
 
         # Nudge offset controls
         nudge_group = QGroupBox("Nudge Offset")
@@ -894,8 +905,10 @@ class PointPickerWidget(QWidget):
         # Enable Apply button if we have at least 4 valid pairs
         self.apply_button.setEnabled(len(valid_pairs) >= 4)
 
-        # Enable Reset button if we have a snapshot
-        self.reset_button.setEnabled(self.transform_snapshot is not None)
+        # Enable Reset / Restart buttons once we have a transform snapshot
+        has_snapshot = self.transform_snapshot is not None
+        self.reset_button.setEnabled(has_snapshot)
+        self.restart_button.setEnabled(has_snapshot)
 
     def _estimate_affine_transform(self) -> np.ndarray | None:
         """Estimate affine transform from point pairs using least squares.
@@ -1060,6 +1073,35 @@ class PointPickerWidget(QWidget):
         layer.translate = (
             self.transform_snapshot["translate"] + self._nudge_offset
         )
+        self.transform_snapshot = None
+        self._applied_affine = None
+        self._affine_base_translate = None
+        self._update_button_states()
+
+    def _restart_from_current(self) -> None:
+        """Drop point pairs and transform state but keep the moving layer's
+        currently displayed (transformed) image in place.
+
+        Re-baselines layer2 so its current world position (minus the active
+        nudge offset) becomes the new "original" translate. Subsequent picks
+        and Apply operations then treat the displayed view as the starting
+        point, enabling iterative refinement: apply -> restart -> pick new
+        correspondences on the partially-aligned image -> apply again.
+        """
+        if self.transform_snapshot is None:
+            return
+        if self.layer2_name not in self.viewer.layers:
+            return
+
+        self._capture_translates()
+        layer = self.viewer.layers[self.layer2_name]
+        # The displayed translate includes the nudge; strip it so the stored
+        # baseline matches what _apply_affine snapshots ("base", not "base + nudge").
+        self._original_translates[self.layer2_name] = (
+            np.array(layer.translate, dtype=float) - self._nudge_offset
+        )
+
+        self.clear_pairs()
         self.transform_snapshot = None
         self._applied_affine = None
         self._affine_base_translate = None
