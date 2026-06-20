@@ -937,6 +937,46 @@ class PointPickerWidget(QWidget):
 
         return affine
 
+    def _print_data_space_residuals(
+        self,
+        data_affine: np.ndarray | None,
+        pairs: dict,
+    ) -> None:
+        """Print residuals for the estimated data-space affine."""
+        if data_affine is None:
+            return
+
+        source_points = np.asarray(pairs[self.layer2_name], dtype=float)
+        target_points = np.asarray(pairs[self.layer1_name], dtype=float)
+        if source_points.size == 0 or target_points.size == 0:
+            return
+
+        ndim = data_affine.shape[0] - 1
+        source_points = source_points[:, :ndim]
+        target_points = target_points[:, :ndim]
+        predicted = (
+            data_affine[:ndim, :ndim] @ source_points.T
+        ).T + data_affine[:ndim, ndim]
+        residuals = predicted - target_points
+        residual_norms = np.linalg.norm(residuals, axis=1)
+        rms = float(np.sqrt(np.mean(residual_norms**2)))
+        max_index = int(np.argmax(residual_norms))
+        max_residual = float(residual_norms[max_index])
+
+        print(
+            "[PointPicker] Data-space residuals after affine "
+            f"(RMS={rms:.3f}, max={max_residual:.3f} at pair {max_index + 1}):"
+        )
+        for index, (residual, norm) in enumerate(
+            zip(residuals, residual_norms),
+            start=1,
+        ):
+            values = ", ".join(f"{value:.3f}" for value in residual)
+            print(
+                f"  pair {index}: residual=({values}), "
+                f"norm={float(norm):.3f}"
+            )
+
     def _apply_affine(self) -> None:
         """Apply the estimated affine transform to the moving layer.
 
@@ -984,6 +1024,7 @@ class PointPickerWidget(QWidget):
             data_affine = self.get_estimated_affine()
             print("[PointPicker] Data-space affine (layer2 → layer1):")
             print(data_affine)
+            self._print_data_space_residuals(data_affine, pairs)
 
             ndim = affine.shape[0] - 1
             A_lin = affine[:ndim, :ndim]
